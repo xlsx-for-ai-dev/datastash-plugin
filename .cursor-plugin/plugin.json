@@ -2,7 +2,7 @@
   "name": "datastash",
   "displayName": "datastash",
   "version": "1.0.0",
-  "description": "datastash: your AI's memory for lists and tables. No setup.\n- Your AI looks up your real data and past chats instead of guessing, so it doesn't make things up about them.\n- Keeps leads, contacts and results in one place, across every chat, and in every AI you connect.\n- Real totals and counts from your data, not estimates.\n- Saves your chats for free, so you can pick up where you left off.\n- Exports to Excel or Google Sheets in one step.\nUse when someone says \"remember these\", \"keep track of\", \"my leads\", \"add to my list\" or \"what did we decide\".",
+  "description": "Your AI's memory for lists and tables. No setup. Keeps leads, contacts and results in one place across every chat and every AI you connect, with real totals, free chat saving, and export to Excel.",
   "author": {
     "name": "Fremen Works",
     "email": "support@xlsx-for-ai.dev"
@@ -20,5 +20,6 @@
     "excel",
     "google-sheets",
     "mcp"
-  ]
+  ],
+  "logo": "assets/favicon.svg"
 }
