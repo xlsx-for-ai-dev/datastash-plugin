@@ -29,10 +29,12 @@ Email support@xlsx-for-ai.dev
 
 ## Testing
 
-For marketplace reviewers. Test account: provided on request.
+For marketplace reviewers. The review key is in the submission form (it is not published here).
 
-1. Connect: add the connector, or paste https://getdatastash.com/mcp into the connector settings.
-2. Sign in: finish the Google sign-in in the browser window that opens.
-3. Save: ask the AI, "Remember these three leads: Acme Co, 1,200; Birch Ltd, 800; Cedar Inc, 500."
-4. Total: ask, "What is the total of my leads?" The answer should be 2,500, worked out from the saved rows.
-5. Export: ask, "Export my leads to Excel." The AI gives a download link to the file.
+Connect with the review key (no sign-in needed): add a custom connector, type Remote HTTPS, URL https://getdatastash.com/mcp. Under HTTP headers add `Authorization: Bearer <review key>`. The key opens a test account with no real data. Normal users connect the same URL and sign in with Google instead.
+
+1. Type: `sync datastash`. The AI turns on sync and confirms in one line.
+2. Say: "Met three people at the webinar: Acme Co, 1,200; Birch Ltd, 800; Cedar Inc, 500." The AI keeps them by itself in a Leads tab and says so in one line.
+3. Ask: "What is the total of my leads?" Expect 2,500, worked out from the saved rows.
+4. Ask: "Export my leads to Excel." Expect a download link to a real .xlsx file.
+5. Start a new chat and say anything. The AI checks in with datastash and opens with what was added since last time.

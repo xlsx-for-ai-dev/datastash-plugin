@@ -1,2 +1,0 @@
-A square (1:1) SVG or PNG logo for datastash goes here, on a background plate, for example assets/logo.svg.
-When it is added, set "logo": "assets/logo.svg" in .cursor-plugin/plugin.json.
