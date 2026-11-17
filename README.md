@@ -1,10 +1,9 @@
 # datastash
 
 datastash: your AI's memory for lists and tables. No setup.
-- Your AI looks up your real data and past chats instead of guessing, so it doesn't make things up about them.
+- Your AI looks up your real data instead of guessing, so it doesn't make things up about them.
 - Keeps leads, contacts and results in one place, across every chat, and in every AI you connect.
 - Real totals and counts from your data, not estimates.
-- Saves your chats for free, so you can pick up where you left off.
 - Exports to Excel or Google Sheets in one step.
 Use when someone says "remember these", "keep track of", "my leads", "add to my list" or "what did we decide".
 
@@ -12,7 +11,7 @@ Use when someone says "remember these", "keep track of", "my leads", "add to my 
 
 1. Add the datastash connector from the marketplace. Or, in your AI's connector settings, paste this address: https://getdatastash.com/mcp
 2. Sign in with Google when asked. There are no keys or passwords to copy.
-3. In a chat, type 'sync datastash'. Your AI then saves your chats and keeps your lists from then on. Say "stop syncing" at any time.
+3. Ask your AI to save something, or type 'sync datastash' to have it keep your data as you go.
 
 ## Pricing
 
@@ -20,9 +19,8 @@ Free up to 5,000 rows. $3 a month per workbook up to 250,000 rows; $6 a month up
 
 ## Privacy and data
 
-- **Consent first, saving after.** Nothing is saved until you type `sync datastash`, your explicit request. Before that, your AI only checks whether sync is on, and that check saves nothing. After you opt in, each exchange is saved to your own private account. Say "stop syncing" at any time and it stops; saved chats stay until you delete them.
-- **Only your own chats and data.** Sync saves your own conversations to your own private datastash account. It also keeps the contacts and lists you give your AI, which can include other people's names and emails: private fields are encrypted, and you can delete any one person at any time.
-- **Routines too.** When sync is on, the results of automations and routines you add datastash to are saved the same way.
+- What's sent: only the rows you or your AI save, like leads, lists, and results, go to getdatastash.com. It happens when you ask, or as you go if you typed 'sync datastash'. To stop it, type 'stop syncing' or remove the connector. To delete anything, ask your AI or use your account page.
+- Contacts you keep can include other people's names and emails: private fields are encrypted, and you can delete any one person at any time.
 - **Shared workbooks, for working with others together.** A shared workbook holds only what happens in a shared session. Data moves from your personal workbooks into a shared one only with your explicit permission, and chat history in your personal workbook can never be transferred.
 - **No secrets.** Your AI is told never to keep passwords or secrets.
 - **Private fields are encrypted.** Names, emails and phone numbers in your lists are encrypted at rest.
