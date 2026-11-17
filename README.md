@@ -18,6 +18,18 @@ Use when someone says "remember these", "keep track of", "my leads", "add to my 
 
 Free up to 5,000 rows. $3 a month per workbook up to 250,000 rows; $6 a month up to 500,000.
 
+## Privacy and data
+
+- **Sync is opt-in.** Nothing is saved automatically until you type `sync datastash`. Say "stop syncing" at any time and it stops; saved chats stay until you delete them.
+- **Only your own chats and data.** Sync saves your own conversations to your own private datastash account. Shared workbooks hold only what happens in a shared session or what you choose to copy in; your personal workbooks and chats are never shared.
+- **No secrets.** Your AI is told never to keep passwords or secrets.
+- **Private fields are encrypted.** Names, emails and phone numbers in your lists are encrypted at rest.
+- **Your control.** Ask your AI to delete rows, a workbook, one person (by email, phone, LinkedIn URL or name), or your whole account. Deleted data leaves our backups within 35 days.
+- **Where it lives.** On our own servers in Germany, with encrypted backups. Logs never hold the contents of your data.
+- **Never sold, never used to train AI.**
+
+Full details: https://getdatastash.com/privacy
+
 ## Privacy and terms
 
 - Privacy: https://getdatastash.com/privacy
