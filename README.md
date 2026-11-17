@@ -20,7 +20,7 @@ Free up to 5,000 rows. $3 a month per workbook up to 250,000 rows; $6 a month up
 
 ## Privacy and data
 
-- **Sync is opt-in.** Nothing is saved automatically until you type `sync datastash`. Say "stop syncing" at any time and it stops; saved chats stay until you delete them.
+- **Consent first, saving after.** Nothing is saved until you type `sync datastash`, your explicit request. Before that, your AI only checks whether sync is on, and that check saves nothing. After you opt in, each exchange is saved to your own private account. Say "stop syncing" at any time and it stops; saved chats stay until you delete them.
 - **Only your own chats and data.** Sync saves your own conversations to your own private datastash account. It also keeps the contacts and lists you give your AI, which can include other people's names and emails: private fields are encrypted, and you can delete any one person at any time.
 - **Routines too.** When sync is on, the results of automations and routines you add datastash to are saved the same way.
 - **Shared workbooks, for working with others together.** A shared workbook holds only what happens in a shared session. Data moves from your personal workbooks into a shared one only with your explicit permission, and chat history in your personal workbook can never be transferred.
