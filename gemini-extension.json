@@ -1,0 +1,11 @@
+{
+  "name": "datastash",
+  "version": "1.0.0",
+  "description": "Keeps your leads, lists and results in one place for your AI. Saves only when you ask, or automatically after you type \"sync datastash\". Tells you every time it saves, and deletes on request. Exports to Excel or Google Sheets in one step.",
+  "mcpServers": {
+    "datastash": {
+      "httpUrl": "https://getdatastash.com/mcp"
+    }
+  },
+  "contextFileName": "GEMINI.md"
+}
