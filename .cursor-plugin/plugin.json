@@ -2,7 +2,7 @@
   "name": "datastash",
   "displayName": "datastash",
   "version": "1.0.0",
-  "description": "Your AI's memory for lists and tables. No setup. Keeps leads, contacts and results in one place across every chat and every AI you connect, with real totals, free chat saving, and export to Excel.",
+  "description": "Keeps your leads, lists and results in one place for your AI. Saves only when you ask, or automatically after you type \"sync datastash\". Tells you every time it saves, and deletes on request. Exports to Excel or Google Sheets in one step.",
   "author": {
     "name": "Fremen Works",
     "email": "support@xlsx-for-ai.dev"
@@ -15,7 +15,6 @@
     "tables",
     "leads",
     "contacts",
-    "chats",
     "spreadsheet",
     "excel",
     "google-sheets",
