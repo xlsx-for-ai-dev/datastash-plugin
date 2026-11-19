@@ -2,7 +2,7 @@
   "name": "datastash",
   "displayName": "datastash",
   "version": "1.1.0",
-  "description": "Keeps your leads, lists and results in one place for your AI. Saves only when you ask, or automatically after you type \"sync datastash\". Tells you every time it saves, and deletes on request. Exports to Excel or Google Sheets in one step. In Cursor, each project joins your datastash agent workbook on its own as an agent named after its folder, with no naming step and no extra sign-in.",
+  "description": "Keeps your leads, lists and results in one place for your AI. Saves only when you ask, or automatically after you type \"sync datastash\". Tells you every time it saves, and deletes on request. Exports to Excel or Google Sheets in one step. Each Cursor project joins your agent workbook automatically, named after its folder.",
   "author": {
     "name": "Fremen Works",
     "email": "support@xlsx-for-ai.dev"
