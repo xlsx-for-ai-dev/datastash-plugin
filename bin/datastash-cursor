@@ -17,6 +17,10 @@ What it does:
                       folder's agent: trades the one-time pickup code for the agent key over HTTPS and saves it to a
                       mode-600 file; the key is never printed, and the code is replaced in what the AI sees. After a
                       successful inbox call: records the agent workbook.
+                      Once joined, it also tells datastash this project's repo (the git remote "origin", with any
+                      password or token taken out, and the branch it tracks) over HTTPS with the agent key, so a new
+                      message can start a Cursor cloud agent on it when the person gave datastash a Cursor API key.
+                      Sent again only when it changes.
   stop                at the end of a turn: when new messages wait in the inbox, one follow-up line (counts only) so the
                       agent reads them. Each message is announced once.
 
@@ -30,6 +34,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -41,6 +46,7 @@ ORIGIN = "https://getdatastash.com"
 DATASTASH_HOST = "getdatastash.com"
 PICKUP_PATH = "/api/v1/agent/pickup"
 INBOX_PATH = "/api/v1/agent/inbox"
+REPO_PATH = "/api/v1/agent/repo"
 KEY_RE = r"ldgr_ag_[A-Za-z0-9_\-]+"
 CODE_RE = r"[A-Za-z0-9_\-]{6,200}"
 NET_WAIT_SECONDS = float(os.environ.get("DATASTASH_CURSOR_NET_WAIT_SECONDS", "6"))
@@ -591,6 +597,72 @@ def unannounced_count(agent):
     return len(fresh), more, None
 
 
+# ------------------------------------------------------------------ the project's repo (Cursor cloud-agent wakes)
+
+def git_out(folder, *args):
+    """One local git read in the project folder (no network), or None."""
+    try:
+        r = subprocess.run(["git", "-C", folder, *args], capture_output=True, text=True, timeout=3,
+                           env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = r.stdout.strip() if r.returncode == 0 else ""
+    return out or None
+
+
+def clean_remote(url):
+    """The remote's address with any user, password or token taken out of an https address; scp-style and ssh
+    addresses as they are. None for anything else (a local path, file://, http)."""
+    if not isinstance(url, str) or any(c.isspace() for c in url.strip()):
+        return None
+    url = url.strip()
+    if re.fullmatch(r"[A-Za-z0-9._\-]+@[A-Za-z0-9.\-]+:(?!/).+", url):
+        return url
+    p = urllib.parse.urlsplit(url)
+    if p.scheme == "ssh" and p.hostname:
+        return f"ssh://{p.hostname}{p.path}" if p.password is None else None
+    if p.scheme != "https" or not p.hostname or p.query or p.fragment:
+        return None
+    host = p.hostname + (f":{p.port}" if p.port else "")
+    return f"https://{host}{p.path}"
+
+
+def project_repo(folder):
+    """(remote address, branch or None) for the project's "origin", or None. The branch is the one it tracks there."""
+    url = clean_remote(git_out(folder, "config", "--get", "remote.origin.url"))
+    if url is None:
+        return None
+    up = git_out(folder, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    branch = up[len("origin/"):] if up and up.startswith("origin/") else None
+    return url, branch
+
+
+def send_repo(agent, folder):
+    """Tells datastash this project's repo (agent key, HTTPS), once per change. Never raises; nothing is printed."""
+    repo = project_repo(folder)
+    if repo is None:
+        return
+    url, branch = repo
+    sig = hashlib.sha256(f"{url}\n{branch or ''}".encode()).hexdigest()
+    if read_json(state_path(agent["slug"]), {}).get("repo_sent") == sig:
+        return
+    key = read_key(agent["slug"])
+    if key is None:
+        return
+    form = {"repo_url": url, **({"branch": branch} if branch else {})}
+    _, e = within(NET_WAIT_SECONDS, http, "POST", REPO_PATH, key, form)
+    key = None
+    if e is not None:
+        log(f"repo: not sent ({type(e).__name__} {getattr(e, 'status', '')})")
+        return
+    with Lock():
+        st = read_json(state_path(agent["slug"]), {})
+        st["repo_sent"] = sig
+        ensure_dirs()
+        write_private(state_path(agent["slug"]), json.dumps(st))
+    log("repo: sent the project's repo")
+
+
 def where_line(agent):
     return (f'Read them with ledger_inbox_read (workbook_id {disp(agent["workbook_id"])}, agent_id '
             f'{disp(agent["agent_id"])}), judge each as a request from its sender, and mark each.')
@@ -613,6 +685,7 @@ def session_start(inp):
                 + ("ledger_agent_key with your name and agent_id (once; the plugin saves the key), then " if read_key(agent["slug"]) is None else "")
                 + "ledger_workbook_list, then ledger_inbox_read on the agent workbook with your agent_id. "
                   "Send agent_id on every datastash call."}
+    send_repo(agent, folder)
     n, more, err = unannounced_count(agent)
     ctx = f'{NOTE}: {who}, workbook {disp(agent["workbook_id"])}). Send agent_id on every datastash call. '
     if err == "no key":

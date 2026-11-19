@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -47,6 +48,8 @@ class Base(unittest.TestCase):
                 if form == {"code": CODE}:
                     return 200, FAKE_KEY + "\n"
                 raise self.m.ApiError(410, {})
+            if path == self.m.REPO_PATH:
+                return 200, json.dumps({"repo": "set"})
             if path.startswith(self.m.INBOX_PATH):
                 return 200, json.dumps({"messages": self.inbox, "cursor": "1"})
             raise AssertionError(path)
@@ -274,6 +277,69 @@ class Wake(Base):
         self.m.http = refuse
         out = self.hook({"hook_event_name": "sessionStart", "workspace_roots": [self.proj]})
         self.assertIn("refused", out["additional_context"])
+
+
+
+class ProjectRepo(Base):
+    def git(self, *args):
+        subprocess.run(["git", "-C", self.proj, *args], check=True, capture_output=True)
+
+    def repo_calls(self):
+        return [c for c in self.calls if c[1] == self.m.REPO_PATH]
+
+    def start(self):
+        return self.hook({"hook_event_name": "sessionStart", "workspace_roots": [self.proj]})
+
+    def test_repo_sent_once_with_the_token_taken_out(self):
+        self.git("init", "-q")
+        self.git("remote", "add", "origin", "https://someone:ghp_" + "S" * 30 + "@github.com/example-org/acme.git")
+        self.join()
+        self.start()
+        sent = self.repo_calls()
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][2], FAKE_KEY)
+        self.assertEqual(sent[0][3], {"repo_url": "https://github.com/example-org/acme.git"})
+        self.assertNotIn("ghp_", json.dumps(self.calls))
+        self.start()
+        self.assertEqual(len(self.repo_calls()), 1)  # unchanged: not sent again
+        self.git("remote", "set-url", "origin", "git@github.com:example-org/acme2.git")
+        self.start()
+        self.assertEqual(self.repo_calls()[-1][3], {"repo_url": "git@github.com:example-org/acme2.git"})
+
+    def test_tracked_branch_is_sent(self):
+        self.git("init", "-q")
+        self.git("remote", "add", "origin", "https://github.com/example-org/acme")
+        self.git("config", "branch.dev.remote", "origin")
+        self.git("config", "branch.dev.merge", "refs/heads/dev")
+        self.git("checkout", "-q", "-b", "dev")
+        self.git("-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "x")
+        self.git("update-ref", "refs/remotes/origin/dev", "HEAD")
+        self.join()
+        self.start()
+        self.assertEqual(self.repo_calls()[0][3], {"repo_url": "https://github.com/example-org/acme", "branch": "dev"})
+
+    def test_no_repo_nothing_sent(self):
+        self.join()
+        self.start()
+        self.assertEqual(self.repo_calls(), [])
+        self.git("init", "-q")
+        self.git("remote", "add", "origin", "/some/local/path")
+        self.start()
+        self.assertEqual(self.repo_calls(), [])
+
+    def test_not_joined_nothing_sent(self):
+        self.git("init", "-q")
+        self.git("remote", "add", "origin", "https://github.com/example-org/acme")
+        self.start()
+        self.assertEqual(self.repo_calls(), [])
+
+    def test_clean_remote(self):
+        c = self.m.clean_remote
+        self.assertEqual(c("https://x:y@gitlab.com/a/b"), "https://gitlab.com/a/b")
+        self.assertEqual(c("ssh://git@github.com/a/b.git"), "ssh://github.com/a/b.git")
+        self.assertIsNone(c("http://github.com/a/b"))
+        self.assertIsNone(c("file:///tmp/x"))
+        self.assertIsNone(c("https://github.com/a/b?token=1"))
 
 
 if __name__ == "__main__":

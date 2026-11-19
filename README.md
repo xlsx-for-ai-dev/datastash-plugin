@@ -31,6 +31,10 @@ registered only on Cursor's own connection.
   messages arrived (counts only, each message once). An idle local Cursor chat can't be woken from outside.
 - Optional, cloud agents: give a project's agent a Cursor Automation's webhook address and key, and new mail starts
   that Automation. Making the Automation (webhook trigger, with the datastash connector) is done by you in Cursor.
+- Optional, one Cursor key for every project: once joined, each project tells datastash its repo (the git remote
+  "origin" with any password or token taken out, and the branch it tracks; sent again only when it changes). If you
+  give datastash your Cursor API key once (tell your AI in any datastash chat), a new message to a project's agent
+  starts a Cursor cloud agent on that repo. Each start is a billed Cursor run.
 - A lost or refused key is not recovered by the agent itself (by design): the project re-registers through your
   one-time datastash connector sign-in once its old agent is switched off.
 - The limit, plainly: projects are kept apart by the plugin and datastash; it doesn't defend against a program with
