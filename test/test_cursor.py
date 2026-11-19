@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -55,6 +56,12 @@ class Base(unittest.TestCase):
             raise AssertionError(path)
         self.inbox = []
         self.m.http = fake_http
+        self.spawned = []
+
+        def inline_repo_send(folder):  # the background send, run here so its calls can be checked
+            self.spawned.append(folder)
+            self.m.cmd_repo([folder])
+        self.m.spawn_repo_send = inline_repo_send
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -280,6 +287,80 @@ class Wake(Base):
 
 
 
+class SessionStartBounded(Base):
+    """sessionStart stays well inside Cursor's 10 s hook timeout: one bounded network wait, a bounded lock wait, and the
+    repo send in a detached background process."""
+
+    def test_stalled_network_returns_within_the_budget(self):
+        self.join()
+        self.m.SESSION_WAIT_SECONDS = 0.5
+
+        def stall(*a, **k):
+            time.sleep(30)
+        self.m.http = stall
+        t0 = time.monotonic()
+        out = self.hook({"hook_event_name": "sessionStart", "workspace_roots": [self.proj]})
+        took = time.monotonic() - t0
+        self.assertLess(took, 2.0, f"sessionStart took {took:.2f}s")
+        self.assertIn("counts unknown", out["additional_context"])
+
+    def test_default_budget_is_well_under_cursors_timeout(self):
+        with open(os.path.join(HERE, "..", "hooks", "hooks.json")) as f:
+            hooks = json.load(f)
+        limit = hooks["hooks"]["sessionStart"][0]["timeout"]
+        self.assertLessEqual(self.m.SESSION_WAIT_SECONDS + self.m.SESSION_LOCK_SECONDS + 2, limit)
+
+    def test_busy_state_lock_never_holds_it(self):
+        self.join()
+        self.inbox = [{"message_id": 1, "status": "new"}]
+        held = self.m.Lock().__enter__()
+        try:
+            t0 = time.monotonic()
+            out = self.hook({"hook_event_name": "sessionStart", "workspace_roots": [self.proj]})
+            took = time.monotonic() - t0
+        finally:
+            held.__exit__(None, None, None)
+        self.assertLess(took, self.m.SESSION_LOCK_SECONDS + 1.0, f"sessionStart took {took:.2f}s")
+        self.assertIn("counts unknown", out["additional_context"])
+        # Nothing was marked: the next check counts it.
+        self.assertIn("1 new messages", self.hook({"hook_event_name": "sessionStart", "workspace_roots": [self.proj]})["additional_context"])
+
+    def test_repo_send_is_a_detached_background_process(self):
+        a = self.join()
+        loaded = load(self.conf)  # the real spawn_repo_send
+        started = []
+
+        class FakePopen:
+            def __init__(self, argv, **kw):
+                started.append((argv, kw))
+        loaded.subprocess.Popen = FakePopen
+        try:
+            loaded.http = lambda *x, **k: (_ for _ in ()).throw(AssertionError("no network inside the hook"))
+            loaded.SESSION_WAIT_SECONDS = 0.2
+            loaded.session_start({"hook_event_name": "sessionStart", "workspace_roots": [self.proj]})
+        finally:
+            loaded.subprocess.Popen = subprocess.Popen
+        self.assertEqual(len(started), 1)
+        argv, kw = started[0]
+        self.assertEqual(argv[-2:], ["repo", self.proj])
+        self.assertTrue(kw.get("start_new_session"))
+        self.assertIs(kw.get("stdout"), subprocess.DEVNULL)
+        self.assertIsNotNone(a)
+
+    def test_measured_hook_process_time(self):
+        """Measured: the real hook process (python start-up, files, the background spawn) for a joined project. Its key
+        file is moved away first, so no request leaves the machine."""
+        a = self.join()
+        os.replace(self.m.key_path(a["slug"]), os.path.join(self.tmp.name, "k.bak"))
+        env = {**os.environ, "DATASTASH_CURSOR_CONFIG_DIR": self.conf}
+        t0 = time.monotonic()
+        r = subprocess.run([sys.executable, "-I", SCRIPT, "hook"], input=json.dumps({"hook_event_name": "sessionStart", "workspace_roots": [self.proj]}),
+                           capture_output=True, text=True, env=env, timeout=10)
+        took = time.monotonic() - t0
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("key file is missing", json.loads(r.stdout)["additional_context"])
+        self.assertLess(took, 3.0, f"hook process took {took:.2f}s")
+
 class ProjectRepo(Base):
     def git(self, *args):
         subprocess.run(["git", "-C", self.proj, *args], check=True, capture_output=True)
@@ -332,6 +413,39 @@ class ProjectRepo(Base):
         self.git("remote", "add", "origin", "https://github.com/example-org/acme")
         self.start()
         self.assertEqual(self.repo_calls(), [])
+
+    def test_repo_record_keyed_by_agent_and_folder(self):
+        self.git("init", "-q")
+        self.git("remote", "add", "origin", "https://github.com/example-org/acme")
+        a = self.join()
+        self.start()
+        self.assertEqual(len(self.repo_calls()), 1)
+        self.start()
+        self.assertEqual(len(self.repo_calls()), 1)
+        # Another agent (a new agent_id) in the same folder under the same name: sent again, with its own key.
+        with open(self.m.conf_path(a["slug"])) as f:
+            c = json.load(f)
+        c["agent_id"] = "ag-2"
+        self.m.write_private(self.m.conf_path(a["slug"]), json.dumps(c))
+        self.start()
+        self.assertEqual(len(self.repo_calls()), 2)
+        self.start()
+        self.assertEqual(len(self.repo_calls()), 2)
+        # The same agent from another folder with the same remote: sent again.
+        other = os.path.realpath(os.path.join(self.tmp.name, "acme-copy"))
+        os.makedirs(other)
+        subprocess.run(["git", "-C", other, "init", "-q"], check=True)
+        subprocess.run(["git", "-C", other, "remote", "add", "origin", "https://github.com/example-org/acme"], check=True)
+        c["projects"] = [self.proj, other]
+        self.m.write_private(self.m.conf_path(a["slug"]), json.dumps(c))
+        self.hook({"hook_event_name": "sessionStart", "workspace_roots": [other]})
+        self.assertEqual(len(self.repo_calls()), 3)
+        # A renamed agent (new name, new agent file) in the first folder: sent again.
+        self.m.os.replace(self.m.conf_path(a["slug"]), os.path.join(self.tmp.name, "old.json"))
+        self.m.write_private(self.m.conf_path("acme-leads-2"), json.dumps({"name": "Acme Leads-2", "agent_id": "ag-3", "projects": [self.proj], "host": "cursor", "workbook_id": "wb-9"}))
+        self.m.write_private(self.m.key_path("acme-leads-2"), FAKE_KEY + "\n")
+        self.start()
+        self.assertEqual(len(self.repo_calls()), 4)
 
     def test_clean_remote(self):
         c = self.m.clean_remote

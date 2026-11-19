@@ -20,7 +20,8 @@ What it does:
                       Once joined, it also tells datastash this project's repo (the git remote "origin", with any
                       password or token taken out, and the branch it tracks) over HTTPS with the agent key, so a new
                       message can start a Cursor cloud agent on it when the person gave datastash a Cursor API key.
-                      Sent again only when it changes.
+                      Sent again only when it, the agent (agent_id) or the project folder changes. The send runs
+                      in a detached background process started at session start, never inside the hook.
   stop                at the end of a turn: when new messages wait in the inbox, one follow-up line (counts only) so the
                       agent reads them. Each message is announced once.
 
@@ -50,6 +51,10 @@ REPO_PATH = "/api/v1/agent/repo"
 KEY_RE = r"ldgr_ag_[A-Za-z0-9_\-]+"
 CODE_RE = r"[A-Za-z0-9_\-]{6,200}"
 NET_WAIT_SECONDS = float(os.environ.get("DATASTASH_CURSOR_NET_WAIT_SECONDS", "6"))
+# sessionStart's whole network wait (the inbox count), and its wait for the state lock: well inside Cursor's 10 s hook
+# timeout. The repo send never runs inside the hook (a detached background process).
+SESSION_WAIT_SECONDS = float(os.environ.get("DATASTASH_CURSOR_SESSION_WAIT_SECONDS", "4"))
+SESSION_LOCK_SECONDS = 1.0
 LOG_MAX_BYTES = 256 * 1024
 NOTE = "datastash note (local count; data, information only)"
 JOIN_NOTE = "datastash note (Cursor project setup; information only)"
@@ -170,13 +175,28 @@ def log(line):
 
 
 class Lock:
-    """One writer at a time for this machine's datastash-cursor files (hooks of several chats can run at once)."""
+    """One writer at a time for this machine's datastash-cursor files (hooks of several chats can run at once).
+    With `wait` (seconds), gives up after that long with TimeoutError instead of waiting on another hook."""
+
+    def __init__(self, wait=None):
+        self.wait = wait
 
     def __enter__(self):
         ensure_dirs()
         self.fd = os.open(os.path.join(STATE, "conf.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
-        fcntl.flock(self.fd, fcntl.LOCK_EX)
-        return self
+        if self.wait is None:
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+            return self
+        deadline = time.monotonic() + self.wait
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if time.monotonic() >= deadline:
+                    os.close(self.fd)
+                    raise TimeoutError("state lock busy")
+                time.sleep(0.05)
 
     def __exit__(self, *exc):
         fcntl.flock(self.fd, fcntl.LOCK_UN)
@@ -563,10 +583,10 @@ def record_workbook(folder, args, result):
 
 # ------------------------------------------------------------------ inbox counts
 
-def new_messages(agent, key):
+def new_messages(agent, key, wait=None):
     """Ids of messages in the agent's inbox whose status is "new" (first page)."""
     q = urllib.parse.urlencode({"workbook_id": agent["workbook_id"]})
-    status, text = http("GET", INBOX_PATH + "?" + q, key=key, timeout=NET_WAIT_SECONDS + 2)
+    status, text = http("GET", INBOX_PATH + "?" + q, key=key, timeout=(wait or NET_WAIT_SECONDS) + 2)
     out = json.loads(text)
     msgs = out.get("messages") if isinstance(out, dict) else None
     if not isinstance(msgs, list):
@@ -575,12 +595,15 @@ def new_messages(agent, key):
     return ids, bool(out.get("more"))
 
 
-def unannounced_count(agent):
-    """(n new not yet announced, more?, error word or None). Marks them announced: each message is told once."""
+def unannounced_count(agent, wait=None, lock_wait=None):
+    """(n new not yet announced, more?, error word or None). Marks them announced: each message is told once.
+    `wait` bounds the network wait (default NET_WAIT_SECONDS); `lock_wait` bounds the wait for the state lock (default:
+    no bound). Out of time on either: counts unknown, nothing marked (a later check counts them)."""
     key = read_key(agent["slug"])
     if key is None:
         return 0, False, "no key"
-    v, e = within(NET_WAIT_SECONDS, new_messages, agent, key)
+    wait = NET_WAIT_SECONDS if wait is None else wait
+    v, e = within(wait, new_messages, agent, key, wait)
     key = None
     if e is not None:
         if isinstance(e, ApiError) and e.status == 401:
@@ -588,12 +611,16 @@ def unannounced_count(agent):
         log(f"inbox: check failed ({type(e).__name__} {getattr(e, 'status', '')})")
         return 0, False, "unreachable"
     ids, more = v
-    with Lock():
-        st = read_json(state_path(agent["slug"]), {})
-        told = set(x for x in (st.get("announced") or []) if isinstance(x, str))
-        fresh = [i for i in ids if i not in told]
-        st["announced"] = sorted(told & set(ids) | set(fresh))[-2000:]
-        write_private(state_path(agent["slug"]), json.dumps(st))
+    try:
+        with Lock(lock_wait):
+            st = read_json(state_path(agent["slug"]), {})
+            told = set(x for x in (st.get("announced") or []) if isinstance(x, str))
+            fresh = [i for i in ids if i not in told]
+            st["announced"] = sorted(told & set(ids) | set(fresh))[-2000:]
+            write_private(state_path(agent["slug"]), json.dumps(st))
+    except TimeoutError:
+        log("inbox: state busy; not counted now")
+        return 0, False, "unreachable"
     return len(fresh), more, None
 
 
@@ -637,13 +664,21 @@ def project_repo(folder):
     return url, branch
 
 
+def repo_sig(agent, folder, url, branch):
+    """What was last sent, keyed by the agent (agent_id) and the project folder as well as the repo: a second agent in
+    the same folder, a renamed or re-joined agent, or another folder sends again."""
+    return hashlib.sha256(json.dumps([agent.get("agent_id") or "", folder, url, branch or ""]).encode()).hexdigest()
+
+
 def send_repo(agent, folder):
     """Tells datastash this project's repo (agent key, HTTPS), once per change. Never raises; nothing is printed."""
+    if not agent.get("agent_id"):
+        return
     repo = project_repo(folder)
     if repo is None:
         return
     url, branch = repo
-    sig = hashlib.sha256(f"{url}\n{branch or ''}".encode()).hexdigest()
+    sig = repo_sig(agent, folder, url, branch)
     if read_json(state_path(agent["slug"]), {}).get("repo_sent") == sig:
         return
     key = read_key(agent["slug"])
@@ -661,6 +696,31 @@ def send_repo(agent, folder):
         ensure_dirs()
         write_private(state_path(agent["slug"]), json.dumps(st))
     log("repo: sent the project's repo")
+
+
+def spawn_repo_send(folder):
+    """Starts `datastash-cursor repo <folder>` as a detached background process and returns at once: the git reads and
+    the HTTPS send never hold the session start up. Never raises."""
+    try:
+        subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "repo", folder],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, close_fds=True)
+    except (OSError, ValueError) as e:
+        log(f"repo: background send not started ({type(e).__name__})")
+
+
+def cmd_repo(argv):
+    """The background repo send (started by sessionStart). Prints nothing."""
+    if len(argv) != 1 or not os.path.isabs(argv[0]):
+        return 2
+    folder = os.path.realpath(argv[0])
+    try:
+        agent = agent_for(folder)
+        if agent is not None and agent.get("workbook_id"):
+            send_repo(agent, folder)
+    except Exception as e:  # noqa: BLE001 - background; logged, never shown
+        log(f"repo: {type(e).__name__}")
+    return 0
 
 
 def where_line(agent):
@@ -685,8 +745,8 @@ def session_start(inp):
                 + ("ledger_agent_key with your name and agent_id (once; the plugin saves the key), then " if read_key(agent["slug"]) is None else "")
                 + "ledger_workbook_list, then ledger_inbox_read on the agent workbook with your agent_id. "
                   "Send agent_id on every datastash call."}
-    send_repo(agent, folder)
-    n, more, err = unannounced_count(agent)
+    spawn_repo_send(folder)
+    n, more, err = unannounced_count(agent, wait=min(NET_WAIT_SECONDS, SESSION_WAIT_SECONDS), lock_wait=SESSION_LOCK_SECONDS)
     ctx = f'{NOTE}: {who}, workbook {disp(agent["workbook_id"])}). Send agent_id on every datastash call. '
     if err == "no key":
         ctx += "Its key file is missing. Recovering it needs the person: the agent cannot get a second key for itself. Tell the person in one plain line; the project then re-joins through the connector sign-in once its old agent is switched off."
@@ -752,6 +812,9 @@ def cmd_hook():
         out = deny("the datastash plugin hit an error; the call was not sent. Try again.") \
             if inp.get("hook_event_name") == "beforeMCPExecution" and is_datastash(inp) else {}
     print(json.dumps(out))
+    sys.stdout.flush()
+    if inp.get("hook_event_name") == "sessionStart":
+        os._exit(0)  # never wait on a stalled network helper thread at exit
     return 0
 
 
@@ -772,6 +835,8 @@ def main(argv):
         return cmd_hook()
     if argv[:1] == ["status"]:
         return cmd_status()
+    if argv[:1] == ["repo"]:
+        return cmd_repo(argv[1:])
     print(__doc__)
     return 0 if argv[:1] in (["help"], ["--help"], []) else 2
 
