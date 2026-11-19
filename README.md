@@ -25,10 +25,16 @@ registered only on Cursor's own connection.
   sent only to getdatastash.com), and links the project folder to the agent and its agent workbook.
 - A Cursor chat is never you: before its project has joined, the plugin lets only the registration through, and after,
   every datastash call must carry that project's own agent id. Cursor has no "datastash main"; that stays in Claude Code.
+- Each project registers only its own folder's name (or that name with `-2`, `-3`), and a name already used by
+  another agent is never reused: the key file is bound to that one folder and its agent id.
 - New mail: a new chat opens with a count of new messages, and at the end of each turn the agent is told when new
-  messages arrived (counts only, each message once). An idle Cursor chat can't be woken from outside.
-- Cloud agents: give a project's agent a Cursor Automation's webhook address and key, and new mail starts that
-  Automation. Making the Automation (webhook trigger, with the datastash connector) is done by you in Cursor.
+  messages arrived (counts only, each message once). An idle local Cursor chat can't be woken from outside.
+- Optional, cloud agents: give a project's agent a Cursor Automation's webhook address and key, and new mail starts
+  that Automation. Making the Automation (webhook trigger, with the datastash connector) is done by you in Cursor.
+- A lost or refused key is not recovered by the agent itself (by design): the project re-registers through your
+  one-time datastash connector sign-in once its old agent is switched off.
+- The limit, plainly: projects are kept apart by the plugin and datastash; it doesn't defend against a program with
+  full shell access to your account, which can read any key file of your user.
 - Requires `python3` (3.8 or later, standard library only). `python3 bin/datastash-cursor status` lists joined projects.
 - Tests: `python3 -I test/test_cursor.py` (offline).
 

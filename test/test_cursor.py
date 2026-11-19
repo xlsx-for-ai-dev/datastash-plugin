@@ -152,6 +152,45 @@ class Scope(Base):
         out = self.hook(mcp("beforeMCPExecution", "x", {}, folder=self.proj, server="evil", mcp_server_url="https://getdatastash.com.evil.example/mcp"))
         self.assertEqual(out["permission"], "allow")
 
+    def test_project_cannot_claim_another_projects_agent(self):
+        self.join()
+        other = os.path.realpath(os.path.join(self.tmp.name, "Beta"))
+        os.makedirs(other)
+        out = self.hook(mcp("beforeMCPExecution", "ledger_agent_register", {"name": "Acme Leads"}, folder=other))
+        self.assertEqual(out["permission"], "deny")
+        # even if the call got through, the server's already_registered answer is not recorded for this folder
+        self.hook(mcp("afterMCPExecution", "ledger_agent_register", {"name": "Acme Leads"},
+                      {"agent_id": "ag-1", "name": "Acme Leads", "already_registered": True}, folder=other))
+        self.assertIsNone(self.m.agent_for(other))
+        self.assertEqual(self.m.agent_for(self.proj)["projects"], [self.proj])
+        same = os.path.realpath(os.path.join(self.tmp.name, "y", "Acme Leads"))
+        os.makedirs(same)
+        for n in ("Acme Leads", "acme leads", "Acme-Leads"):
+            self.assertEqual(self.hook(mcp("beforeMCPExecution", "ledger_agent_register", {"name": n}, folder=same))["permission"], "deny", n)
+        self.assertEqual(self.hook(mcp("beforeMCPExecution", "ledger_agent_register", {"name": "Acme Leads-2"}, folder=same))["permission"], "allow")
+
+    def test_already_registered_name_without_local_file_is_not_reused(self):
+        out = self.hook(mcp("postToolUse", "ledger_agent_register", {"name": "Acme Leads"},
+                            {"agent_id": "ag-old", "already_registered": True}, folder=self.proj,
+                            tool_output=json.dumps({"agent_id": "ag-old", "already_registered": True})))
+        self.assertIsNone(self.m.agent_for(self.proj))
+        self.assertIn('"Acme Leads-2"', out["additional_context"])
+
+    def test_rejoin_same_folder_keeps_its_agent(self):
+        self.join()
+        self.hook(mcp("afterMCPExecution", "ledger_agent_register", {"name": "Acme Leads"},
+                      {"agent_id": "ag-1", "already_registered": True}, folder=self.proj))
+        self.assertEqual(self.m.agent_for(self.proj)["agent_id"], "ag-1")
+
+    def test_only_own_name_chain_before_join(self):
+        for n, want in (("Acme Leads", "allow"), ("Acme Leads-3", "allow"), ("Other", "deny"), ("Acme Leads-1", "deny"), (" Acme Leads", "deny")):
+            out = self.hook(mcp("beforeMCPExecution", "ledger_agent_register", {"name": n}, folder=self.proj))
+            self.assertEqual(out["permission"], want, n)
+
+    def test_name_alone_does_not_trust_a_foreign_url(self):
+        out = self.hook(mcp("beforeMCPExecution", "x", {}, folder=self.proj, server="datastash", mcp_server_url="https://evil.example/mcp"))
+        self.assertEqual(out["permission"], "allow")
+
     def test_no_folder_denies_datastash(self):
         out = self.hook(mcp("beforeMCPExecution", "ledger_agent_register", {"name": "a"}))
         self.assertEqual(out["permission"], "deny")

@@ -285,6 +285,28 @@ def next_name(name):
     return f"{name}-2"
 
 
+def owned_elsewhere(folder, name):
+    """True when this name's agent file on this machine belongs to another project folder (never reused)."""
+    s = slug(name)
+    if s is None:
+        return True
+    c = read_json(conf_path(s), {})
+    if not c:
+        return False
+    return folder not in (c.get("projects") or []) or c.get("name") != name
+
+
+def name_ok(folder, name):
+    """A folder registers only its own name: the folder's name, or that name with -2, -3 (when taken), and never a name
+    whose agent file belongs to another project. So one project can never claim another project's agent."""
+    if not isinstance(name, str) or name != name.strip() or not name:
+        return False
+    base = folder_name(folder)
+    if name != base and not re.fullmatch(re.escape(base) + r"-[2-9]\d{0,3}", name):
+        return False
+    return name.lower() not in RESERVED_NAMES and not owned_elsewhere(folder, name)
+
+
 def auto_name(folder):
     """The name this folder registers under: the folder's name, with -2, -3 when another project on this machine has it."""
     mine = {a["slug"]: a for a in all_agents()}
@@ -302,16 +324,20 @@ def auto_name(folder):
 def is_datastash(inp):
     """True when the MCP call goes to a datastash connector: its server name says datastash, or its URL is on
     getdatastash.com. Cursor may prefix plugin server names, so the name is matched anywhere, in any case."""
+    url_given = False
+    for k in ("mcp_server_url", "url"):
+        v = inp.get(k)
+        if isinstance(v, str) and v.strip():
+            url_given = True
+            host = (urllib.parse.urlsplit(v.strip()).hostname or "").lower()
+            if host == DATASTASH_HOST or host.endswith("." + DATASTASH_HOST):
+                return True
+    if url_given:
+        return False  # a URL elsewhere decides: a server merely named "datastash" is not the connector
     for k in ("mcp_server_name", "server_name"):
         v = inp.get(k)
         if isinstance(v, str) and "datastash" in v.lower():
             return True
-    for k in ("mcp_server_url", "url"):
-        v = inp.get(k)
-        if isinstance(v, str):
-            host = (urllib.parse.urlsplit(v.strip()).hostname or "").lower()
-            if host == DATASTASH_HOST or host.endswith("." + DATASTASH_HOST):
-                return True
     return False
 
 
@@ -372,7 +398,7 @@ def before_mcp(inp):
     aid = agent.get("agent_id") if agent else None
     if not aid:
         name = auto_name(folder)
-        if tool == "ledger_agent_register" and not args.get("agent_id") and isinstance(args.get("name"), str):
+        if tool == "ledger_agent_register" and not args.get("agent_id") and name_ok(folder, args.get("name")):
             return {"permission": "allow"}
         return deny(f'This Cursor project is not a datastash agent yet, so the call was not sent. First call '
                     f'ledger_agent_register with name "{name}" and no agent_id (if that name is taken, with "{next_name(name)}"), '
@@ -421,7 +447,7 @@ def record_register(folder, args, result):
     if args.get("agent_id"):
         return None  # a helper under an agent: not this folder's own agent
     name = args.get("name")
-    if not isinstance(name, str) or not name.strip():
+    if not name_ok(folder, name):
         return None
     got = None
     for d in answer_dicts(result):
@@ -432,20 +458,19 @@ def record_register(folder, args, result):
         return None
     if isinstance(got.get("name"), str) and got["name"] != name:
         return None
-    name = name.strip()
     s = slug(name)
-    if s is None:
-        return None
     mine = agent_for(folder)
     if mine is not None and mine.get("agent_id") and mine["slug"] != s:
         return None  # this folder already joined as another agent
     c = read_json(conf_path(s), {})
-    others = [p for p in (c.get("projects") or []) if p != folder]
-    if c and (c.get("name") != name or (others and c.get("agent_id") not in (None, got["agent_id"]))):
-        log("register: another project already uses that agent file name; not recorded")
-        return (f'{JOIN_NOTE}: another Cursor project on this machine keeps an agent under a name like "{disp(name)}"; '
-                f'register "{disp(next_name(name))}" instead.')
-    c.update({"name": name, "agent_id": got["agent_id"], "projects": others + [folder], "host": "cursor"})
+    if c and c.get("agent_id") not in (None, got["agent_id"]):
+        return None
+    if got.get("already_registered") is True and c.get("agent_id") != got["agent_id"]:
+        # The name was registered on this connection before, but not by this folder on this machine: never reuse it.
+        log("register: name already registered elsewhere on this connection; not recorded")
+        return (f'{JOIN_NOTE}: "{disp(name)}" already belongs to another agent, so this project does not use it. '
+                f'Register "{disp(next_name(name))}" instead.')
+    c.update({"name": name, "agent_id": got["agent_id"], "projects": [folder], "host": "cursor"})
     ensure_dirs()
     write_private(conf_path(s), json.dumps(c, indent=2))
     log("register: recorded the agent for a project")
@@ -585,15 +610,15 @@ def session_start(inp):
     who = f'This Cursor project is the datastash agent "{disp(agent["name"])}" (agent_id {disp(agent["agent_id"])}'
     if not agent.get("workbook_id"):
         return {"additional_context": f"{JOIN_NOTE}: {who}). Finish joining: "
-                + ("ledger_agent_key with your name and agent_id, then " if read_key(agent["slug"]) is None else "")
+                + ("ledger_agent_key with your name and agent_id (once; the plugin saves the key), then " if read_key(agent["slug"]) is None else "")
                 + "ledger_workbook_list, then ledger_inbox_read on the agent workbook with your agent_id. "
                   "Send agent_id on every datastash call."}
     n, more, err = unannounced_count(agent)
     ctx = f'{NOTE}: {who}, workbook {disp(agent["workbook_id"])}). Send agent_id on every datastash call. '
     if err == "no key":
-        ctx += "Its key file is missing; call ledger_agent_key with your name and agent_id and the plugin saves a new one."
+        ctx += "Its key file is missing. Recovering it needs the person: the agent cannot get a second key for itself. Tell the person in one plain line; the project then re-joins through the connector sign-in once its old agent is switched off."
     elif err == "key refused":
-        ctx += "Its key was refused (switched off, or a newer key was issued); call ledger_agent_key for a new one."
+        ctx += "Its key was refused (switched off, or a newer key was issued). Recovering it needs the person: the agent cannot get a second key for itself. Tell the person in one plain line; the project then re-joins through the connector sign-in once its old agent is switched off."
     elif err:
         ctx += "The inbox check could not reach datastash; counts unknown."
     elif n:
