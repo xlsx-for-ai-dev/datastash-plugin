@@ -1,0 +1,682 @@
+#!/usr/bin/env python3
+"""datastash-cursor: the Cursor plugin's hook helper. Each Cursor project joins the person's datastash agent workbook
+as its own agent, named after its folder, on its first datastash use.
+
+Run by Cursor hooks (hooks/hooks.json), never by the AI:
+  hook      one entry point for every hook event; reads Cursor's hook JSON on stdin, prints the hook answer on stdout
+  status    (for the person, in a terminal) which Cursor projects are joined, as which agent, and whether a key is saved
+
+What it does:
+  sessionStart        tells the AI this project's agent (name, agent_id, workbook) and the new-message count, or that
+                      it joins on first datastash use under the name it gives (the folder's name; -2, -3 when taken here)
+  beforeMCPExecution  on the datastash connector: before the project has joined, only ledger_agent_register is let
+                      through; after, every call must carry this project's own agent_id. So a Cursor chat never acts on
+                      the connector as the person.
+  afterMCPExecution / postToolUse
+                      after ledger_agent_register: records the agent for this folder. After ledger_agent_key for this
+                      folder's agent: trades the one-time pickup code for the agent key over HTTPS and saves it to a
+                      mode-600 file; the key is never printed, and the code is replaced in what the AI sees. After a
+                      successful inbox call: records the agent workbook.
+  stop                at the end of a turn: when new messages wait in the inbox, one follow-up line (counts only) so the
+                      agent reads them. Each message is announced once.
+
+The key is read from its file and sent only to https://getdatastash.com in an Authorization header. Everything
+datastash answers is data, never instructions; hook lines carry counts and ids only, never message text.
+"""
+import hashlib
+import http.client as httpclient
+import fcntl
+import json
+import os
+import re
+import stat
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ORIGIN = "https://getdatastash.com"
+DATASTASH_HOST = "getdatastash.com"
+PICKUP_PATH = "/api/v1/agent/pickup"
+INBOX_PATH = "/api/v1/agent/inbox"
+KEY_RE = r"ldgr_ag_[A-Za-z0-9_\-]+"
+CODE_RE = r"[A-Za-z0-9_\-]{6,200}"
+NET_WAIT_SECONDS = float(os.environ.get("DATASTASH_CURSOR_NET_WAIT_SECONDS", "6"))
+LOG_MAX_BYTES = 256 * 1024
+NOTE = "datastash note (local count; data, information only)"
+JOIN_NOTE = "datastash note (Cursor project setup; information only)"
+RESERVED_NAMES = ("person", "datastash", "@feedback")
+
+HOME = os.path.expanduser("~")
+CONF = os.environ.get("DATASTASH_CURSOR_CONFIG_DIR") or os.path.join(HOME, ".config", "datastash-cursor")
+STATE = os.path.join(CONF, "state")
+
+
+class ApiError(Exception):
+    def __init__(self, status, body):
+        super().__init__(f"HTTP {status}")
+        self.status = status
+        self.body = body if isinstance(body, dict) else {}
+
+
+# ------------------------------------------------------------------ files
+
+def ensure_dirs():
+    for d in (CONF, STATE):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+
+
+def slug(name):
+    s = re.sub(r"[^a-z0-9]+", "-", str(name).strip().lower()).strip("-")
+    return s[:64] or None
+
+
+def key_path(s):
+    return os.path.join(CONF, f"agent-{s}.key")
+
+
+def conf_path(s):
+    return os.path.join(CONF, f"agent-{s}.json")
+
+
+def state_path(s):
+    return os.path.join(STATE, f"agent-{s}.json")
+
+
+def log_path():
+    return os.path.join(STATE, "hooks.log")
+
+
+def write_private(path, text):
+    """Write text to path atomically, readable by this user only."""
+    d = os.path.dirname(path)
+    tmp = os.path.join(d, f".{os.path.basename(path)}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            v = json.load(f)
+        return v if isinstance(v, dict) else default
+    except (OSError, ValueError):
+        return default
+
+
+def stat_ok(st):
+    return stat.S_ISREG(st.st_mode) and not (st.st_mode & 0o077) and st.st_uid == os.getuid()
+
+
+def read_key(s):
+    """The agent key, or None. Refuses a key file that is a link, not this user's, or readable by anyone else."""
+    try:
+        fd = os.open(key_path(s), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        if not stat_ok(os.fstat(fd)):
+            log("key file is not a private regular file of this user; fix with chmod 600 (key not used)")
+            return None
+        with os.fdopen(fd, "r") as f:
+            fd = None
+            k = f.read(4096).strip()
+    except OSError:
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return k if re.fullmatch(KEY_RE, k) else None
+
+
+def log(line):
+    """Hook log: events and HTTP status codes only; never a key, a pickup code or message text."""
+    try:
+        ensure_dirs()
+        p = log_path()
+        try:
+            if os.path.getsize(p) > LOG_MAX_BYTES:
+                os.replace(p, p + ".1")
+        except OSError:
+            pass
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z ") + line.replace("\n", " ")[:300] + "\n")
+    except OSError:
+        pass
+
+
+class Lock:
+    """One writer at a time for this machine's datastash-cursor files (hooks of several chats can run at once)."""
+
+    def __enter__(self):
+        ensure_dirs()
+        self.fd = os.open(os.path.join(STATE, "conf.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
+def disp(text, n=80):
+    """Server or folder text shown in a hook line: plain characters only, short."""
+    return re.sub(r"[^A-Za-z0-9 ._\-]", "", str(text))[:n]
+
+
+# ------------------------------------------------------------------ http
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # never re-send a key or code elsewhere
+        raise ApiError(code, {"error": "redirect"})
+
+
+_opener = urllib.request.build_opener(_NoRedirect())
+
+
+def http(method, path, key=None, form=None, timeout=20):
+    url = ORIGIN + path
+    headers = {"Accept": "application/json", "User-Agent": "datastash-cursor-plugin/1.1"}
+    data = None
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    if key is not None:
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with _opener.open(req, timeout=timeout) as r:
+            return r.status, r.read(1 << 20).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        text = e.read(1 << 16).decode("utf-8", "replace") if e.fp else ""
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = {}
+        raise ApiError(e.code, parsed)
+
+
+def within(seconds, fn, *args):
+    """Run fn in a helper thread and wait at most `seconds`: a stalled network never holds Cursor up. None on timeout."""
+    out = {}
+
+    def run():
+        try:
+            out["v"] = fn(*args)
+        except Exception as e:  # noqa: BLE001 - reported as a failed check, never raised into Cursor
+            out["e"] = e
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        return None, TimeoutError("no answer in time")
+    return out.get("v"), out.get("e")
+
+
+# ------------------------------------------------------------------ agents and folders
+
+def all_agents():
+    out = []
+    try:
+        names = sorted(os.listdir(CONF))
+    except OSError:
+        return out
+    for fn in names:
+        m = re.fullmatch(r"agent-([a-z0-9\-]{1,64})\.json", fn)
+        if not m:
+            continue
+        c = read_json(os.path.join(CONF, fn), {})
+        if isinstance(c.get("name"), str):
+            c["slug"] = m.group(1)
+            out.append(c)
+    return out
+
+
+def agent_for(folder):
+    """The agent this Cursor project folder joined as, or None."""
+    if folder is None:
+        return None
+    for a in all_agents():
+        if folder in (a.get("projects") or []):
+            return a
+    return None
+
+
+def folder_of(inp):
+    """The project folder: Cursor's first workspace root (realpath), or None when Cursor gave none."""
+    roots = inp.get("workspace_roots")
+    if isinstance(roots, list):
+        for r in roots:
+            if isinstance(r, str) and r.strip():
+                return os.path.realpath(r)
+    return None
+
+
+def folder_name(folder):
+    """The agent name a folder gives: its own name, made plain (letters, digits, space, dot, dash, underscore; at most
+    40 characters); "agent" when nothing is left."""
+    base = re.sub(r"[^A-Za-z0-9 ._\-]+", "-", os.path.basename(folder.rstrip("/")) or "").strip(" .-_")[:40].strip(" .-_")
+    return base or "agent"
+
+
+def next_name(name):
+    m = re.fullmatch(r"(.*)-(\d{1,4})", name)
+    if m and m.group(1):
+        return f"{m.group(1)}-{int(m.group(2)) + 1}"
+    return f"{name}-2"
+
+
+def auto_name(folder):
+    """The name this folder registers under: the folder's name, with -2, -3 when another project on this machine has it."""
+    mine = {a["slug"]: a for a in all_agents()}
+    name = folder_name(folder)
+    for _ in range(1000):
+        other = mine.get(slug(name))
+        if name.strip().lower() not in RESERVED_NAMES and (other is None or folder in (other.get("projects") or [])):
+            return name
+        name = next_name(name)
+    return None
+
+
+# ------------------------------------------------------------------ the datastash connector's calls
+
+def is_datastash(inp):
+    """True when the MCP call goes to a datastash connector: its server name says datastash, or its URL is on
+    getdatastash.com. Cursor may prefix plugin server names, so the name is matched anywhere, in any case."""
+    for k in ("mcp_server_name", "server_name"):
+        v = inp.get(k)
+        if isinstance(v, str) and "datastash" in v.lower():
+            return True
+    for k in ("mcp_server_url", "url"):
+        v = inp.get(k)
+        if isinstance(v, str):
+            host = (urllib.parse.urlsplit(v.strip()).hostname or "").lower()
+            if host == DATASTASH_HOST or host.endswith("." + DATASTASH_HOST):
+                return True
+    return False
+
+
+def base_tool(name):
+    """The connector's own tool name from Cursor's (possibly prefixed) tool name."""
+    name = str(name or "")
+    m = re.search(r"(ledger_[a-z_]+)$", name)
+    if m:
+        return m.group(1)
+    return re.split(r"__|:|/", name)[-1]
+
+
+def as_obj(v):
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            return v
+    return v
+
+
+def tool_args(inp):
+    a = as_obj(inp.get("tool_input"))
+    return a if isinstance(a, dict) else {}
+
+
+def answer_dicts(v, depth=0):
+    """Every JSON object inside a tool answer: the answer may be a CallToolResult whose text content is JSON."""
+    if depth > 6:
+        return
+    v = as_obj(v)
+    if isinstance(v, dict):
+        yield v
+        for x in v.values():
+            yield from answer_dicts(x, depth + 1)
+    elif isinstance(v, list):
+        for x in v[:50]:
+            yield from answer_dicts(x, depth + 1)
+
+
+def answer_failed(v):
+    for d in answer_dicts(v):
+        if d.get("isError") is True or (isinstance(d.get("error"), str) and d.get("error")):
+            return True
+    return False
+
+
+def before_mcp(inp):
+    """beforeMCPExecution: the datastash connector is used only as this project's agent."""
+    if not is_datastash(inp):
+        return {"permission": "allow"}
+    folder = folder_of(inp)
+    tool = base_tool(inp.get("tool_name"))
+    args = tool_args(inp)
+    if folder is None:
+        return deny("Cursor gave no project folder, so this chat has no datastash agent. Open a folder and try again.")
+    agent = agent_for(folder)
+    aid = agent.get("agent_id") if agent else None
+    if not aid:
+        name = auto_name(folder)
+        if tool == "ledger_agent_register" and not args.get("agent_id") and isinstance(args.get("name"), str):
+            return {"permission": "allow"}
+        return deny(f'This Cursor project is not a datastash agent yet, so the call was not sent. First call '
+                    f'ledger_agent_register with name "{name}" and no agent_id (if that name is taken, with "{next_name(name)}"), '
+                    "with no question to the person; the plugin keeps the agent_id it answers. Then repeat this call with that agent_id.")
+    if args.get("agent_id") == aid:
+        return {"permission": "allow"}
+    if tool == "ledger_agent_register" and not args.get("agent_id") and args.get("name") == agent.get("name"):
+        return {"permission": "allow"}  # asking again for its own agent_id
+    return deny(f'In this Cursor project datastash is used only as its agent "{disp(agent["name"])}": send '
+                f'agent_id "{disp(aid)}" on every datastash call. The call was not sent.')
+
+
+def deny(msg):
+    return {"permission": "deny", "agent_message": msg, "user_message": "datastash: " + msg}
+
+
+def after_mcp(inp, output_field=None):
+    """afterMCPExecution and postToolUse: learn the agent, its key and its workbook from the connector's answers.
+    Returns (extra hook output, context line or None). Idempotent: both events may see the same answer.
+    Only a call Cursor names as going to the datastash connector (server name or URL) is learned from. A postToolUse
+    that does not name its server is only scrubbed: a pickup code this plugin already traded is taken out of it."""
+    trusted = is_datastash(inp)
+    if not trusted and "ledger_" not in str(inp.get("tool_name") or ""):
+        return {}, None
+    folder = folder_of(inp)
+    if folder is None:
+        return {}, None
+    tool = base_tool(inp.get("tool_name"))
+    args = tool_args(inp)
+    result = inp.get("result_json") if "result_json" in inp else inp.get("tool_output")
+    if answer_failed(result):
+        return {}, None
+    with Lock():
+        if tool == "ledger_agent_key":
+            return trade_pickup(folder, result, output_field, inp.get(output_field) if output_field else None, trusted)
+        if not trusted:
+            return {}, None
+        if tool == "ledger_agent_register":
+            return {}, record_register(folder, args, result)
+        if tool in ("ledger_inbox_read", "ledger_inbox_send", "ledger_inbox_webhook", "ledger_inbox_mark"):
+            return {}, record_workbook(folder, args, result)
+    return {}, None
+
+
+def record_register(folder, args, result):
+    if args.get("agent_id"):
+        return None  # a helper under an agent: not this folder's own agent
+    name = args.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    got = None
+    for d in answer_dicts(result):
+        if isinstance(d.get("agent_id"), str) and d["agent_id"].strip():
+            got = d
+            break
+    if got is None:
+        return None
+    if isinstance(got.get("name"), str) and got["name"] != name:
+        return None
+    name = name.strip()
+    s = slug(name)
+    if s is None:
+        return None
+    mine = agent_for(folder)
+    if mine is not None and mine.get("agent_id") and mine["slug"] != s:
+        return None  # this folder already joined as another agent
+    c = read_json(conf_path(s), {})
+    others = [p for p in (c.get("projects") or []) if p != folder]
+    if c and (c.get("name") != name or (others and c.get("agent_id") not in (None, got["agent_id"]))):
+        log("register: another project already uses that agent file name; not recorded")
+        return (f'{JOIN_NOTE}: another Cursor project on this machine keeps an agent under a name like "{disp(name)}"; '
+                f'register "{disp(next_name(name))}" instead.')
+    c.update({"name": name, "agent_id": got["agent_id"], "projects": others + [folder], "host": "cursor"})
+    ensure_dirs()
+    write_private(conf_path(s), json.dumps(c, indent=2))
+    log("register: recorded the agent for a project")
+    return (f'{JOIN_NOTE}: this project is the datastash agent "{disp(name)}" (agent_id {disp(got["agent_id"])}). Next: '
+            f'call ledger_agent_key with name "{disp(name)}" and that agent_id; the plugin saves the key itself (never run '
+            "the fetch line it gives).")
+
+
+def trade_pickup(folder, result, output_field, original, trusted):
+    agent = agent_for(folder)
+    if agent is None or not agent.get("agent_id"):
+        return {}, None
+    code = None
+    for d in answer_dicts(result):
+        if isinstance(d.get("pickup_code"), str) and d.get("agent_id") == agent["agent_id"]:
+            code = d["pickup_code"].strip()
+            break
+    if code is None or not re.fullmatch(CODE_RE, code):
+        return {}, None
+    s = agent["slug"]
+    st = read_json(state_path(s), {})
+    tag = hashlib.sha256(code.encode()).hexdigest()
+    if st.get("traded") != tag:
+        if not trusted:
+            return {}, None
+        status, err = None, None
+        text, e = within(30, http, "POST", PICKUP_PATH, None, {"code": code})
+        if e is not None:
+            err = e
+        else:
+            status, body = text
+            key = body.strip()
+            if status == 200 and re.fullmatch(KEY_RE, key):
+                write_private(key_path(s), key + "\n")
+                key = None
+                st = read_json(state_path(s), {})
+                st["traded"] = tag
+                write_private(state_path(s), json.dumps(st))
+                log("pickup: agent key saved")
+            else:
+                err = ApiError(status, {})
+        if err is not None:
+            log(f"pickup: not saved ({type(err).__name__} {getattr(err, 'status', '')})")
+            return {}, (f'{JOIN_NOTE}: the agent key for "{disp(agent["name"])}" could not be saved (the pickup did not '
+                        "work). Call ledger_agent_key again for a new code; the plugin saves it.")
+    line = (f'{JOIN_NOTE}: the agent key for "{disp(agent["name"])}" is saved on this machine (mode 600, never shown); the '
+            "pickup code is used up. Next: ledger_workbook_list, then ledger_inbox_read on the agent workbook with your "
+            "agent_id; that links this project to it.")
+    extra = {}
+    if output_field:
+        extra["updated_mcp_tool_output"] = scrubbed(original, code, line)
+    return extra, line
+
+
+def scrubbed(original, code, line):
+    """The tool answer the AI sees, with the used pickup code (and the fetch line that carries it) taken out."""
+    o = as_obj(original)
+    if isinstance(o, dict) and isinstance(o.get("content"), list):
+        return {**o, "content": [{"type": "text", "text": json.dumps({"saved": True, "note": line})}]}
+    if isinstance(o, str):
+        return o.replace(code, "[used by the plugin]")
+    return {"content": [{"type": "text", "text": json.dumps({"saved": True, "note": line})}]}
+
+
+def record_workbook(folder, args, result):
+    agent = agent_for(folder)
+    if agent is None or agent.get("workbook_id") or args.get("agent_id") != agent.get("agent_id"):
+        return None
+    wid = None
+    for d in answer_dicts(result):
+        if isinstance(d.get("workbook_id"), str) and d["workbook_id"].strip():
+            wid = d["workbook_id"].strip()
+            break
+    if wid is None or not re.fullmatch(r"[A-Za-z0-9_\-]{1,100}", wid):
+        return None
+    c = read_json(conf_path(agent["slug"]), {})
+    if c.get("agent_id") != agent.get("agent_id"):
+        return None
+    c["workbook_id"] = wid
+    write_private(conf_path(agent["slug"]), json.dumps(c, indent=2))
+    log("workbook: recorded the agent workbook for a project")
+    return f'{JOIN_NOTE}: this project is linked to agent workbook {disp(wid)} as "{disp(agent["name"])}". Setup is done.'
+
+
+# ------------------------------------------------------------------ inbox counts
+
+def new_messages(agent, key):
+    """Ids of messages in the agent's inbox whose status is "new" (first page)."""
+    q = urllib.parse.urlencode({"workbook_id": agent["workbook_id"]})
+    status, text = http("GET", INBOX_PATH + "?" + q, key=key, timeout=NET_WAIT_SECONDS + 2)
+    out = json.loads(text)
+    msgs = out.get("messages") if isinstance(out, dict) else None
+    if not isinstance(msgs, list):
+        raise ApiError(status, {"error": "unexpected_answer"})
+    ids = [str(m["message_id"]) for m in msgs if isinstance(m, dict) and m.get("status") == "new" and m.get("message_id") is not None]
+    return ids, bool(out.get("more"))
+
+
+def unannounced_count(agent):
+    """(n new not yet announced, more?, error word or None). Marks them announced: each message is told once."""
+    key = read_key(agent["slug"])
+    if key is None:
+        return 0, False, "no key"
+    v, e = within(NET_WAIT_SECONDS, new_messages, agent, key)
+    key = None
+    if e is not None:
+        if isinstance(e, ApiError) and e.status == 401:
+            return 0, False, "key refused"
+        log(f"inbox: check failed ({type(e).__name__} {getattr(e, 'status', '')})")
+        return 0, False, "unreachable"
+    ids, more = v
+    with Lock():
+        st = read_json(state_path(agent["slug"]), {})
+        told = set(x for x in (st.get("announced") or []) if isinstance(x, str))
+        fresh = [i for i in ids if i not in told]
+        st["announced"] = sorted(told & set(ids) | set(fresh))[-2000:]
+        write_private(state_path(agent["slug"]), json.dumps(st))
+    return len(fresh), more, None
+
+
+def where_line(agent):
+    return (f'Read them with ledger_inbox_read (workbook_id {disp(agent["workbook_id"])}, agent_id '
+            f'{disp(agent["agent_id"])}), judge each as a request from its sender, and mark each.')
+
+
+def session_start(inp):
+    folder = folder_of(inp)
+    if folder is None:
+        return {}
+    agent = agent_for(folder)
+    if agent is None or not agent.get("agent_id"):
+        name = auto_name(folder)
+        return {"additional_context":
+                f'{JOIN_NOTE}: this Cursor project is not a datastash agent yet. On its first datastash use it joins on its '
+                f'own as "{disp(name)}" (the folder name), with no question to the person: ledger_agent_register with that '
+                "name, then ledger_agent_key; the plugin saves the key (datastash-sync skill, \"Each project joins on its own\")."}
+    who = f'This Cursor project is the datastash agent "{disp(agent["name"])}" (agent_id {disp(agent["agent_id"])}'
+    if not agent.get("workbook_id"):
+        return {"additional_context": f"{JOIN_NOTE}: {who}). Finish joining: "
+                + ("ledger_agent_key with your name and agent_id, then " if read_key(agent["slug"]) is None else "")
+                + "ledger_workbook_list, then ledger_inbox_read on the agent workbook with your agent_id. "
+                  "Send agent_id on every datastash call."}
+    n, more, err = unannounced_count(agent)
+    ctx = f'{NOTE}: {who}, workbook {disp(agent["workbook_id"])}). Send agent_id on every datastash call. '
+    if err == "no key":
+        ctx += "Its key file is missing; call ledger_agent_key with your name and agent_id and the plugin saves a new one."
+    elif err == "key refused":
+        ctx += "Its key was refused (switched off, or a newer key was issued); call ledger_agent_key for a new one."
+    elif err:
+        ctx += "The inbox check could not reach datastash; counts unknown."
+    elif n:
+        ctx += f"{n}{'+' if more else ''} new messages in its inbox. " + where_line(agent)
+    else:
+        ctx += "No new messages."
+    return {"additional_context": ctx}
+
+
+def stop(inp):
+    if inp.get("status") not in (None, "completed"):
+        return {}
+    agent = agent_for(folder_of(inp))
+    if agent is None or not agent.get("agent_id") or not agent.get("workbook_id"):
+        return {}
+    n, more, err = unannounced_count(agent)
+    if err or not n:
+        return {}
+    return {"followup_message": f'{NOTE}: agent "{disp(agent["name"])}": {n}{"+" if more else ""} new messages arrived '
+                                f"in your inbox. " + where_line(agent)}
+
+
+# ------------------------------------------------------------------ entry points
+
+def hook_input():
+    try:
+        v = json.loads(sys.stdin.read(4 << 20) or "{}")
+        return v if isinstance(v, dict) else {}
+    except ValueError:
+        return {}
+
+
+def run_hook(inp):
+    ev = inp.get("hook_event_name")
+    if ev == "sessionStart":
+        return session_start(inp)
+    if ev == "beforeMCPExecution":
+        return before_mcp(inp)
+    if ev == "afterMCPExecution":
+        after_mcp(inp)
+        return {}
+    if ev == "postToolUse":
+        extra, line = after_mcp(inp, output_field="tool_output")
+        if line:
+            extra["additional_context"] = line
+        return extra
+    if ev == "stop":
+        return stop(inp)
+    return {}
+
+
+def cmd_hook():
+    inp = hook_input()
+    try:
+        out = run_hook(inp)
+    except Exception as e:  # noqa: BLE001 - a hook never crashes Cursor; a datastash call is refused, others go on
+        log(f"hook {disp(inp.get('hook_event_name'), 40)}: {type(e).__name__}")
+        out = deny("the datastash plugin hit an error; the call was not sent. Try again.") \
+            if inp.get("hook_event_name") == "beforeMCPExecution" and is_datastash(inp) else {}
+    print(json.dumps(out))
+    return 0
+
+
+def cmd_status():
+    agents = [a for a in all_agents() if a.get("host") == "cursor"]
+    if not agents:
+        print("no Cursor project has joined datastash on this machine yet")
+        return 0
+    for a in agents:
+        k = "key saved (mode 600)" if read_key(a["slug"]) else "no key yet"
+        print(f'"{disp(a["name"])}": agent_id {disp(a.get("agent_id") or "-")}; workbook {disp(a.get("workbook_id") or "not linked yet")}; '
+              f'{k}; folders: {", ".join(a.get("projects") or []) or "none"}')
+    return 0
+
+
+def main(argv):
+    if argv[:1] == ["hook"]:
+        return cmd_hook()
+    if argv[:1] == ["status"]:
+        return cmd_status()
+    print(__doc__)
+    return 0 if argv[:1] in (["help"], ["--help"], []) else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

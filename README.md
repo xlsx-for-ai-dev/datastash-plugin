@@ -13,6 +13,25 @@ Use when someone says "remember these", "keep track of", "my leads", "add to my 
 2. Sign in with Google when asked. There are no keys or passwords to copy.
 3. Ask your AI to save something, or type 'sync datastash' to have it keep your data as you go.
 
+## Cursor: each project joins on its own
+
+In Cursor, every project's agent joins your datastash agent workbook by itself on its first datastash use, named after
+its project folder (with `-2`, `-3` when another project on this computer has that name). There is no naming step and no
+sign-in beyond the one-time datastash connector sign-in. Your other apps' datastash connections stay yours: agents are
+registered only on Cursor's own connection.
+
+- The plugin's hooks hold it together: the agent registers, the plugin trades its one-time pickup code for the agent key
+  itself and keeps it in `~/.config/datastash-cursor/agent-<name>.key` (folder mode 700, file mode 600, never shown,
+  sent only to getdatastash.com), and links the project folder to the agent and its agent workbook.
+- A Cursor chat is never you: before its project has joined, the plugin lets only the registration through, and after,
+  every datastash call must carry that project's own agent id. Cursor has no "datastash main"; that stays in Claude Code.
+- New mail: a new chat opens with a count of new messages, and at the end of each turn the agent is told when new
+  messages arrived (counts only, each message once). An idle Cursor chat can't be woken from outside.
+- Cloud agents: give a project's agent a Cursor Automation's webhook address and key, and new mail starts that
+  Automation. Making the Automation (webhook trigger, with the datastash connector) is done by you in Cursor.
+- Requires `python3` (3.8 or later, standard library only). `python3 bin/datastash-cursor status` lists joined projects.
+- Tests: `python3 -I test/test_cursor.py` (offline).
+
 ## Pricing
 
 Free up to 5,000 rows. $3 a month per workbook up to 250,000 rows; $6 a month up to 500,000. Above 500,000 rows, contact us.
