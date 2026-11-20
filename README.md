@@ -10,7 +10,7 @@ Use when someone says "remember these", "keep track of", "my leads", "add to my 
 ## How to connect
 
 1. Add the datastash connector from the marketplace. Or, in your AI's connector settings, paste this address: https://getdatastash.com/mcp
-2. Sign in with Google when asked. There are no keys or passwords to copy.
+2. Sign in once. In Claude Code, type /mcp, pick "datastash" and choose "Authenticate". In the Claude desktop app, open the datastash connector in settings and press Connect. A browser opens for the Google sign-in. There are no keys or passwords to copy.
 3. Ask your AI to save something, or type 'sync datastash' to have it keep your data as you go.
 
 ## Cursor: each project joins on its own
